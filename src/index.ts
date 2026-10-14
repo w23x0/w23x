@@ -106,6 +106,17 @@ async function main() {
     process.exit(0);
   }
 
+  if (cmd === 'reset-session') {
+    const cfg = loadCfg();
+    ensureDataDirs(cfg.dataDir);
+    const { SESSION_START_FILE } = await import('./app.js');
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    mkdirSync(join(cfg.dataDir, 'state'), { recursive: true });
+    writeFileSync(join(cfg.dataDir, 'state', SESSION_START_FILE), JSON.stringify({ ts: Date.now() }));
+    console.log('chat session will start fresh on next daemon start (raw log untouched)');
+    process.exit(0);
+  }
+
   if (cmd === 'backup') {
     const cfg = loadCfg();
     ensureDataDirs(cfg.dataDir);

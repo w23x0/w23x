@@ -63,6 +63,15 @@ const ZERO_USAGE = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+// written by `reset-session`: chat history before this ts is not restored into the persona's context
+export const SESSION_START_FILE = 'session-start.json';
+
+// a blank line in a reply becomes a separate IM message, the way a person sends them
+export function splitParagraphs(text: string): string[] {
+  const parts = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  return parts.length ? parts : [text];
+}
+
 function formatTime(ts: number, channel: string): string {
   const d = new Date(ts);
   const y = d.getFullYear();
@@ -146,6 +155,8 @@ export function createApp(deps: AppDeps): App {
 
   const contextWindow = models.primary.model?.contextWindow ?? 100000;
   const tokenBudget = Math.floor(contextWindow * 0.75);
+  // the system prompt is never trimmed, so keep the verbatim samples a small slice of the budget
+  const voiceSampleMaxChars = Math.min(3000, Math.floor(tokenBudget * 0.1));
 
   function resetIdle() {
     if (!idleTimer) return;
@@ -153,13 +164,13 @@ export function createApp(deps: AppDeps): App {
     idleTimer = setTimeout(() => { app.runReflection().catch((e) => console.error('reflection timer', e)); }, config.idleMinutes * 60_000);
   }
 
-  const chatAgent = createAvatarAgent(models.primary, { dataDir, mode: 'chat', transformContext: async (msgs: any[]) => trimMessages(msgs, tokenBudget) });
+  const chatAgent = createAvatarAgent(models.primary, { dataDir, mode: 'chat', voiceSampleMaxChars, transformContext: async (msgs: any[]) => trimMessages(msgs, tokenBudget) });
   function refreshPersonaPrompt() {
     const msgs = chatAgent.state.messages as any[];
     const i = msgs.findIndex((m: any) => m?.role === 'system');
     if (i >= 0) {
       const copy = [...msgs];
-      copy[i] = { ...msgs[i], content: buildPersonaSystemPrompt(dataDir, config.personaBriefMaxChars) };
+      copy[i] = { ...msgs[i], content: buildPersonaSystemPrompt(dataDir, config.personaBriefMaxChars, voiceSampleMaxChars) };
       (chatAgent as any).state.messages = copy;
     }
   }
@@ -170,8 +181,10 @@ export function createApp(deps: AppDeps): App {
     let total = 0;
     const raws = allRaw(dataDir);
     const m = models.primary.model;
+    const sessionStart = readJsonSafe(join(dataDir, 'state', SESSION_START_FILE))?.ts;
     for (let i = raws.length - 1; i >= 0; i--) {
       const r = raws[i];
+      if (typeof sessionStart === 'number' && r.ts < sessionStart) break;
       if (r.role === 'import') continue;
       if (r.channel === 'cli') continue;
       let msg: any;
@@ -208,7 +221,7 @@ export function createApp(deps: AppDeps): App {
     if (!contact) throw new Error('no contact for channel');
     const adapter = adapters.find((a) => a.name === ch) || adapters[0];
     if (!adapter) throw new Error('no adapter');
-    await adapter.send(contact.chatId, text);
+    for (const part of splitParagraphs(text)) await adapter.send(contact.chatId, part);
     sentTextsForRun.push(text);
     const rawMsg: RawMessage = { ts: now(), channel: ch, userId: contact.userId, role: 'proactive', text };
     appendRaw(dataDir, rawMsg);
@@ -308,7 +321,7 @@ export function createApp(deps: AppDeps): App {
             role: 'assistant',
             text: reply,
           });
-          if (adapter) await adapter.send(msg.chatId, reply);
+          if (adapter) for (const part of splitParagraphs(reply)) await adapter.send(msg.chatId, part);
         }
         resetIdle();
       });
@@ -395,7 +408,7 @@ export function createApp(deps: AppDeps): App {
           }
           prompt += `These are objective records of his computer activity; extract long-term understanding (schedule, projects, interests, state changes). Do not copy entries verbatim.\n`;
         }
-        prompt += `Use tools (read_raw with offset/limit) to page through messages; do not expect full content here. Update your understanding layer if warranted; keep persona.md in sync with your understanding.\n`;
+        prompt += `Use tools (read_raw with offset/limit) to page through messages; do not expect full content here. Update your understanding layer if warranted; keep persona.md in sync with your understanding. Also check persona.md against the persona.md requirements in your instructions (surface-writing section first, under 4000 chars, nothing you would not want said out loud) and restructure it if it falls short.\n`;
 
         const readVersions = new Map<string, string>();
         const reflAgent = createAvatarAgent(models.reflection, { dataDir, mode: 'reflection', readVersions });
@@ -459,6 +472,7 @@ export function createApp(deps: AppDeps): App {
           sendMessage: async (channel: string | undefined, text: string) => { await sendToContact(channel, text); },
           scheduleNextWake: schedCallback,
           personaBriefMaxChars: config.personaBriefMaxChars,
+          voiceSampleMaxChars,
         });
         const ch = getLastChannel();
         const channels = adapters.length ? adapters.map((a: any) => a.name).join(', ') : 'none';

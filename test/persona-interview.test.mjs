@@ -168,9 +168,12 @@ test('interview records stay out of the external persona: not restored into chat
   appendRaw(dataDir, { ts: Date.now() - 3500_000, channel: 'cli', userId: 'local', role: 'assistant', text: 'CLI_QUESTION' });
   const prompts = [];
   const { app } = makeApp((ctx, i) => { if (isProactive(i)) prompts.push(i.userText); return say('ok'); }, { dataDir });
-  const sess = app.sessionMessages().map(txt).join('\n');
+  const all = app.sessionMessages();
+  const sess = all.filter((m) => m.role !== 'system').map(txt).join('\n');
   assert.ok(sess.includes('OUTREACH_X'));
-  assert.ok(!sess.includes('CLI_ANSWER') && !sess.includes('CLI_QUESTION'));
+  assert.ok(!sess.includes('CLI_ANSWER') && !sess.includes('CLI_QUESTION'), 'interview turns are not chat history');
+  // his own interview lines may appear only as verbatim typing samples; the observer's questions never do
+  assert.ok(!all.map(txt).join('\n').includes('CLI_QUESTION'));
   await app.runProactiveWake('manual');
   const line = prompts[0].split('\n').find((l) => l.includes('OUTREACH_X'));
   assert.ok(line && !/\d+\s*分钟后回复/.test(line), `outreach must not count the cli answer as a reply: ${line}`);
