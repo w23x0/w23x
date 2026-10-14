@@ -201,6 +201,69 @@ async function main() {
     }
     process.exit(0);
   }
+  if (cmd === 'sense') {
+    const sub = effectiveArgs[1];
+    const cfg = loadCfg();
+    ensureDataDirs(cfg.dataDir);
+    ensureUnderstandingRepo(cfg.dataDir);
+    if (!cfg.sense) { console.log('sense not configured'); process.exit(1); }
+    if (sub === 'tick') {
+      const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+      const app = createApp({ config: cfg, models: { primary, reflection }, adapters: [] });
+      const r = await app.runSenseTick();
+      console.log(`processed=${r.processed} digests=${r.digests.join(',') || '-'}${r.error ? ' error=' + r.error : ''}`);
+      process.exit(0);
+    }
+    if (sub === 'today') {
+      const { readActivityCards, localDay } = await import('./sense/pipeline.js');
+      const day = localDay(Date.now());
+      const cards = readActivityCards(cfg.dataDir, day);
+      for (const c of cards) {
+        const d = (ts: number) => { const x = new Date(ts); return `${String(x.getHours()).padStart(2,'0')}:${String(x.getMinutes()).padStart(2,'0')}`; };
+        console.log(`[${d(c.start)}–${d(c.end)}] 在场 ${c.activeMinutes}m / 离开 ${c.afkMinutes}m ${c.card || (c.paused ? '（暂停）' : (c.empty ? '（无数据）' : c.summary))}`);
+      }
+      process.exit(0);
+    }
+    if (sub === 'status') {
+      const { createSense } = await import('./sense/pipeline.js');
+      const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+      const s = createSense({ config: cfg, models: { primary, reflection }, now: Date.now });
+      const st = await s.status();
+      console.log(JSON.stringify(st));
+      process.exit(0);
+    }
+    if (sub === 'pause' && effectiveArgs[2]) {
+      const { createSense } = await import('./sense/pipeline.js');
+      const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+      const s = createSense({ config: cfg, models: { primary, reflection }, now: Date.now });
+      const mins = Number(effectiveArgs[2]);
+      console.log(JSON.stringify(s.pause(mins)));
+      process.exit(0);
+    }
+    if (sub === 'resume') {
+      const { createSense } = await import('./sense/pipeline.js');
+      const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+      const s = createSense({ config: cfg, models: { primary, reflection }, now: Date.now });
+      s.resume();
+      process.exit(0);
+    }
+    if (sub === 'github') {
+      const { createSense } = await import('./sense/pipeline.js');
+      const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+      const s = createSense({ config: cfg, models: { primary, reflection }, now: Date.now });
+      const rel = await s.githubBackfill();
+      console.log(rel);
+      const oldHead = understandingHead(cfg.dataDir);
+      const app = createApp({ config: cfg, models: { primary, reflection }, adapters: [] });
+      const r = await app.runReflection();
+      console.log(`reflection ran=${r.ran}${r.reason ? ' (' + r.reason + ')' : ''}`);
+      const stat = understandingDiffStat(cfg.dataDir, oldHead);
+      if (stat) console.log(stat);
+      process.exit(0);
+    }
+    console.error('unknown sense subcommand');
+    process.exit(1);
+  }
 
   // daemon or run
   if (cmd && cmd !== 'run') {

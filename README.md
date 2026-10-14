@@ -99,6 +99,56 @@ import 与 interview 是仅有的需要构造模型的 CLI 命令，都不启动
 
 用户在对话中表达的交流偏好，由理解者自行识别并写入理解层，代码不硬编码任何具体偏好。
 
+## 本机活动感知（sense）
+
+让理解者知道他平时在电脑上做什么，包括不在电脑前的时候。采集交给 ActivityWatch，本应用只读它的本地 REST API。
+
+### 采集组件（本机，systemd 用户服务）
+
+- [awatcher](https://github.com/2e3s/awatcher)：内置 ActivityWatch 服务（`localhost:5600`）+ 窗口与离开检测。GNOME Wayland 需要扩展 [Focused Window D-Bus](https://extensions.gnome.org/extension/5592/focused-window-d-bus/)。
+- [aw-watcher-media-player](https://github.com/2e3s/aw-watcher-media-player)：通过 MPRIS 记录正在播放的音乐与视频。
+- 可选 [aw-watcher-web](https://github.com/ActivityWatch/aw-watcher-web)：浏览器扩展，记录网址与标签页标题。
+- 另外直接读取：`gitRoots` 下本地仓库的提交、`claudeProjectsDir` 下 Claude Code 会话中他发出的消息。
+
+### 配置
+
+配置里有 `sense` 对象（哪怕是 `{}`）即启用：
+
+```json
+"sense": {
+  "activityWatchUrl": "http://127.0.0.1:5600",
+  "blockMinutes": 30,
+  "lagMinutes": 5,
+  "maxCatchupBlocks": 48,
+  "gitRoots": ["~/projects"],
+  "claudeProjectsDir": "~/.claude/projects",
+  "githubUser": "your-name",
+  "githubTokenEnv": "GITHUB_TOKEN",
+  "exclude": { "apps": ["keepass"], "titlePatterns": ["bank|银行"], "domains": ["mail.google.com"] }
+}
+```
+
+### 流程
+
+- 守护进程每 5 分钟检查一次，按本地时间对齐的块（默认 30 分钟）处理：汇总信号 → 反思模型写一张时间线卡片（无工具）→ 追加到 `raw/activity-YYYY-MM-DD.jsonl`。没有任何信号（关机）或暂停的块不调用模型。
+- 过了午夜生成前一天的日报 `raw/digests/day-YYYY-MM-DD.md`，并触发一次反思。
+- 反思时理解者会看到新的卡片、日报与报告，用 `list_activity` / `read_activity` / `read_activity_file` / `search_activity` 查看，自行提炼进理解层。
+- 状态：`state/sense-cursor.json`、`state/sense-pauses.json`、`state/sense-reflection.json`。
+
+### 隐私
+
+- `exclude` 命中的应用、标题、域名在汇总前就被抹掉，不会进入文件或模型请求。
+- `sense pause <分钟>` 暂停记录，`sense resume` 恢复。
+- 分身（Telegram/Discord）没有活动工具，看不到任何活动材料；只能通过理解者写进理解层的结论间接知道。
+
+### CLI
+
+- `sense tick`：立即处理待处理的块
+- `sense today`：查看今天的时间线
+- `sense status`：ActivityWatch 是否可达、bucket、游标、暂停状态
+- `sense pause <分钟>` / `sense resume`
+- `sense github`：抓取 GitHub 全貌报告（仓库、README、近一年提交）写入 `raw/sense/`，随后运行一次反思
+
 ## 安全
 
 - 只允许配置的本人用户 id（Telegram/Discord fail-closed）。

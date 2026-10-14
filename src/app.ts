@@ -1,4 +1,5 @@
 import { ensureDataDirs } from './data/store.js';
+import { createSense } from './sense/pipeline.js';
 import { ensureUnderstandingRepo, listFiles } from './data/understanding.js';
 import { createEncryptedBackup } from './backup.js';
 import { allRaw, appendRaw, saveRawMedia } from './data/raw.js';
@@ -8,7 +9,7 @@ import { createMemoryTools } from './agent/tools.js';
 import type { ResolvedModel } from './model.js';
 import type { AppConfig } from './config.js';
 import type { ChannelAdapter, InboundMessage } from './channels/types.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { transcribe as transcribeVoice } from './transcribe.js';
 import { join } from 'node:path';
 import { trimMessages, msgContentTokens } from './agent/context.js';
@@ -19,6 +20,7 @@ export interface AppDeps {
   adapters: ChannelAdapter[];
   now?: () => number;
   transcribe?: (voice: any) => Promise<string>;
+  senseSources?: any;
 }
 
 export interface ProactiveDecision {
@@ -36,6 +38,7 @@ export interface App {
   handleInbound(msg: InboundMessage): Promise<void>;
   runReflection(): Promise<{ ran: boolean; reason?: string }>;
   runProactiveWake(trigger?: 'scheduled' | 'manual'): Promise<ProactiveDecision>;
+  runSenseTick(): Promise<{ processed: number; digests: string[]; error?: string }>;
   sessionMessages(): any[];
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -82,14 +85,14 @@ function localTime(ts: number): string {
 }
 export function createApp(deps: AppDeps): App {
   const config = deps.config;
-  const dataDir = config.dataDir;
   const now = deps.now || Date.now;
+  const dataDir = config.dataDir;
   const models = deps.models;
   const adapters = deps.adapters;
-
   ensureDataDirs(dataDir);
   ensureUnderstandingRepo(dataDir);
   mkdirSync(join(dataDir, 'state'), { recursive: true });
+  const sense = (config as any).sense ? createSense({ config, models, sources: (deps as any).senseSources, now }) : null;
 
   const transcribe = deps.transcribe || (async (voice: any) => {
     if (!config.transcription) throw new Error('no transcription configured');
@@ -130,6 +133,8 @@ export function createApp(deps: AppDeps): App {
   let started = false;
   let idleTimer: any = null;
   let proactiveTimer: any = null;
+  let senseTimer: any = null;
+  let senseRunning = false;
   let backupTimer: any = null;
 
   let reflectionRunning = false;
@@ -318,7 +323,53 @@ export function createApp(deps: AppDeps): App {
         const msgs = allRaw(dataDir);
         const cursor = loadCursor();
         const newOnes = msgs.slice(cursor);
-        if (newOnes.length === 0) return { ran: false, reason: 'no new messages' };
+
+        // sense-reflection state
+        const senseReflPath = join(dataDir, 'state', 'sense-reflection.json');
+        const senseRefl = readJsonSafe(senseReflPath) || { activityTs: 0, files: [] };
+        const prevActivityTs = typeof senseRefl.activityTs === 'number' ? senseRefl.activityTs : 0;
+        const prevFiles: string[] = Array.isArray(senseRefl.files) ? senseRefl.files : [];
+
+        // list digests/sense files relative to raw/
+        function listActivityFiles(sub: string): string[] {
+          const dir = join(dataDir, 'raw', sub);
+          const out: string[] = [];
+          try {
+            for (const f of readdirSync(dir)) {
+              if (f.endsWith('.md')) out.push(`${sub}/${f}`);
+            }
+          } catch {}
+          return out.sort();
+        }
+        const currentFiles = [...listActivityFiles('digests'), ...listActivityFiles('sense')];
+        const newActivityFiles = currentFiles.filter((f) => !prevFiles.includes(f));
+
+        // new cards with start > prevActivityTs and card non-null
+        // count by reading activity files
+        let newCardCount = 0;
+        let newCardMin = Infinity;
+        let newCardMax = -Infinity;
+        try {
+          const rawDir = join(dataDir, 'raw');
+          for (const f of readdirSync(rawDir).filter((x) => x.startsWith('activity-') && x.endsWith('.jsonl'))) {
+            for (const line of readFileSync(join(rawDir, f), 'utf8').split('\n')) {
+              if (!line.trim()) continue;
+              try {
+                const c = JSON.parse(line);
+                if (c?.card && typeof c.start === 'number' && c.start > prevActivityTs) {
+                  newCardCount++;
+                  if (c.start < newCardMin) newCardMin = c.start;
+                  if (c.start > newCardMax) newCardMax = c.start;
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+
+        if (newOnes.length === 0 && newActivityFiles.length === 0) {
+          return { ran: false, reason: 'no new messages' };
+        }
+
         const startOffset = cursor;
         const endOffset = msgs.length - 1;
         const startTs = newOnes[0]?.ts;
@@ -329,13 +380,23 @@ export function createApp(deps: AppDeps): App {
           ? `Imports among them: ${imports.length} (${Array.from(new Set(imports.map((m) => `${m.source?.label || ''} ${m.source?.date || ''}`.trim()))).join('; ')})`
           : 'Imports among them: 0';
         const interviewSummary = `Interview records (channel cli) among them: ${interviews.length}`;
-        const prompt =
-          `Reflection. New raw messages since last reflection: ${newOnes.length} (offset ${startOffset} to ${endOffset}).\n` +
-          `Time range: ${startTs ? localTime(startTs) : ''} to ${endTs ? localTime(endTs) : ''}.\n` +
-          `${importSummary}\n` +
-          `${interviewSummary}\n` +
-          `Use tools (read_raw with offset/limit) to page through them; do not expect full content here. ` +
-          `Update your understanding layer if warranted; keep persona.md in sync with your understanding.\n`;
+
+        let prompt = `Reflection. New raw messages since last reflection: ${newOnes.length} (offset ${startOffset} to ${endOffset}).\n`;
+        if (newOnes.length) prompt += `Time range: ${startTs ? localTime(startTs) : ''} to ${endTs ? localTime(endTs) : ''}.\n`;
+        prompt += `${importSummary}\n${interviewSummary}\n`;
+        if (newActivityFiles.length || newCardCount) {
+          prompt += `\nNew activity material:\n`;
+          if (newCardCount) {
+            const range = (newCardMin !== Infinity) ? `${localTime(newCardMin)} to ${localTime(newCardMax)}` : '';
+            prompt += `- ${newCardCount} new timeline card segment(s)${range ? ` (${range})` : ''}; use list_activity / read_activity / search_activity to inspect.\n`;
+          }
+          if (newActivityFiles.length) {
+            prompt += `- new files: ${newActivityFiles.join(', ')}; use read_activity_file to inspect.\n`;
+          }
+          prompt += `These are objective records of his computer activity; extract long-term understanding (schedule, projects, interests, state changes). Do not copy entries verbatim.\n`;
+        }
+        prompt += `Use tools (read_raw with offset/limit) to page through messages; do not expect full content here. Update your understanding layer if warranted; keep persona.md in sync with your understanding.\n`;
+
         const readVersions = new Map<string, string>();
         const reflAgent = createAvatarAgent(models.reflection, { dataDir, mode: 'reflection', readVersions });
         let failed = false;
@@ -349,7 +410,26 @@ export function createApp(deps: AppDeps): App {
           console.error('reflection turn failed', e);
           failed = true;
         }
-        if (!failed) saveCursor(msgs.length);
+        if (!failed) {
+          saveCursor(msgs.length);
+          // sense-reflection update
+          try {
+            const activityFiles = currentFiles;
+            // max start among all cards non-null
+            let maxStart = prevActivityTs;
+            const rawDir = join(dataDir, 'raw');
+            for (const f of readdirSync(rawDir).filter((x) => x.startsWith('activity-') && x.endsWith('.jsonl'))) {
+              for (const line of readFileSync(join(rawDir, f), 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                try {
+                  const c = JSON.parse(line);
+                  if (c?.card && typeof c.start === 'number' && c.start > maxStart) maxStart = c.start;
+                } catch {}
+              }
+            }
+            writeJson(senseReflPath, { activityTs: maxStart, files: activityFiles });
+          } catch {}
+        }
         return { ran: true };
       } finally {
         reflectionRunning = false;
@@ -447,6 +527,18 @@ export function createApp(deps: AppDeps): App {
       }
     },
 
+    async runSenseTick(): Promise<{ processed: number; digests: string[]; error?: string }> {
+      if (!sense) return { processed: 0, digests: [], error: 'sense not configured' };
+      if (senseRunning) return { processed: 0, digests: [], error: 'already running' };
+      senseRunning = true;
+      let r: { processed: number; digests: string[]; error?: string };
+      try { r = await sense.tick(); } finally { senseRunning = false; }
+      if (r.digests && r.digests.length) {
+        try { await app.runReflection(); } catch (e) { console.error('sense reflection trigger', e); }
+      }
+      return r;
+    },
+
     sessionMessages(): any[] {
       return (chatAgent as any).state?.messages || [];
     },
@@ -466,6 +558,11 @@ export function createApp(deps: AppDeps): App {
       const delay = (nextWakeAt as number) <= now() ? 50 : Math.max(0, (nextWakeAt as number) - now());
       proactiveTimer = setTimeout(() => { app.runProactiveWake('scheduled').catch((e) => console.error('proactive timer', e)); }, delay);
 
+    if (sense) {
+      app.runSenseTick().catch((e) => console.error('sense tick', e));
+      senseTimer = setInterval(() => { app.runSenseTick().catch((e) => console.error('sense tick', e)); }, 5 * 60 * 1000);
+    }
+
     const backup = config.backup;
     if (backup) {
       const envName = backup.passphraseEnv || 'AVATAR_BACKUP_PASSPHRASE';
@@ -479,14 +576,14 @@ export function createApp(deps: AppDeps): App {
         }, (backup.intervalHours || 24) * 3600_000);
       }
     }
-
-    },
+  },
 
     async stop(): Promise<void> {
       started = false;
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
       if (backupTimer) { clearInterval(backupTimer); backupTimer = null; }
+      if (senseTimer) { clearInterval(senseTimer); senseTimer = null; }
       for (const a of adapters) {
         try { await a.stop(); } catch {}
       }

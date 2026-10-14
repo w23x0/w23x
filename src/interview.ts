@@ -1,6 +1,7 @@
 import { allRaw, appendRaw } from './data/raw.js';
 import { ensureDataDirs } from './data/store.js';
 import { ensureUnderstandingRepo, listFiles } from './data/understanding.js';
+import { readActivityCards, localDay } from './sense/pipeline.js';
 import { createAvatarAgent, runAgentTurn } from './agent/avatar.js';
 import { createMemoryTools } from './agent/tools.js';
 import { trimMessages } from './agent/context.js';
@@ -93,6 +94,7 @@ export function createInterview(deps: InterviewDeps): Interview {
         `导入的种子对话：${imports.length ? imports.join('; ') : '无'}`,
         `理解层已有文件：${understandingCount}`,
         `外部渠道已有对话：${externalCount} 条`,
+        `今日活动时间线：${readActivityCards(dataDir, localDay(now())).length} 段（可用 read_activity 查看）`,
       ].join('\n');
       const target = priorInterview
         ? '之后的访谈：依据理解层中的不确定之处与你认为值得探询的议题继续，避免重复已经探索过的内容。'

@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 
 export interface ModelSpec {
@@ -19,6 +20,20 @@ export interface TranscriptionConfig { baseUrl: string; apiKey?: string; model: 
 
 export interface BackupConfig { dir: string; intervalHours: number; passphraseEnv?: string }
 
+
+
+export interface SenseConfig {
+  activityWatchUrl: string;
+  blockMinutes: number;
+  lagMinutes: number;
+  maxCatchupBlocks: number;
+  exclude: { apps: string[]; titlePatterns: string[]; domains: string[] };
+  githubUser?: string;
+  githubTokenEnv: string;
+  gitRoots: string[];
+  claudeProjectsDir?: string;
+}
+
 export interface AppConfig {
   dataDir: string;
   model: ModelSpec;
@@ -27,6 +42,7 @@ export interface AppConfig {
   proactiveFallbackMinutes: number;
   proactiveMinMinutes: number;
   personaBriefMaxChars: number;
+  sense?: SenseConfig;
   telegramToken?: string;
   allowedTelegramUserId?: string;
   discordToken?: string;
@@ -97,6 +113,33 @@ export function loadConfig(opts?: { configPath?: string; env?: Record<string, st
     ? { dir: backupRaw.dir, intervalHours: backupRaw.intervalHours ?? 24, passphraseEnv: backupRaw.passphraseEnv } as BackupConfig
     : undefined;
 
+  const expandPath = (p: any) => (typeof p === 'string' && p.startsWith('~/')) ? join(homedir(), p.slice(2)) : p;
+  let sense: SenseConfig | undefined;
+  const senseRaw = fileCfg?.sense;
+  const senseProvided = senseRaw !== null && senseRaw !== undefined && typeof senseRaw === 'object' && !Array.isArray(senseRaw);
+  if (senseProvided) {
+    const exRaw = (senseRaw.exclude && typeof senseRaw.exclude === 'object') ? senseRaw.exclude : {};
+    const blockMinutes = senseRaw.blockMinutes ?? 30;
+    if (!blockMinutes || 1440 % Number(blockMinutes) !== 0) {
+      throw new Error('blockMinutes must divide 1440');
+    }
+    sense = {
+      activityWatchUrl: senseRaw.activityWatchUrl ?? 'http://127.0.0.1:5600',
+      blockMinutes: Number(blockMinutes),
+      lagMinutes: senseRaw.lagMinutes ?? 5,
+      maxCatchupBlocks: senseRaw.maxCatchupBlocks ?? 48,
+      exclude: {
+        apps: Array.isArray(exRaw.apps) ? exRaw.apps : [],
+        titlePatterns: Array.isArray(exRaw.titlePatterns) ? exRaw.titlePatterns : [],
+        domains: Array.isArray(exRaw.domains) ? exRaw.domains : [],
+      },
+      githubUser: senseRaw.githubUser,
+      githubTokenEnv: senseRaw.githubTokenEnv ?? 'GITHUB_TOKEN',
+      gitRoots: Array.isArray(senseRaw.gitRoots) ? senseRaw.gitRoots.map(expandPath) : [],
+      claudeProjectsDir: expandPath(senseRaw.claudeProjectsDir),
+    };
+  }
+
   return {
     dataDir,
     model,
@@ -111,5 +154,6 @@ export function loadConfig(opts?: { configPath?: string; env?: Record<string, st
     allowedDiscordUserId: strEnv(env, 'DISCORD_ALLOWED_USER_ID') ?? fileCfg?.allowedDiscordUserId,
     transcription,
     backup,
+    sense,
   };
 }
