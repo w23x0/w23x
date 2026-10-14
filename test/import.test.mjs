@@ -85,19 +85,19 @@ test('runSeedImport triggers one reflection immediately; prompt states facts abo
   assert.equal(readFileUnder(d, 'seed-understanding.md'), '初步理解（来自导入）');
 });
 
-test('cold start still happens after an import (no direct conversation yet) and is told about the seed', async () => {
-  const { importSeed, createApp, ensureDataDirs, ensureUnderstandingRepo, writeFileUnder } = await mods();
+test('the first interview builds on imported seeds: told about the seed, not preloaded, runs on the reflection model', async () => {
+  const { importSeed, ensureDataDirs, ensureUnderstandingRepo, writeFileUnder } = await mods();
+  const { createInterview } = await import('../dist/interview.js');
   const d = tmpDataDir(); ensureDataDirs(d); ensureUnderstandingRepo(d);
   importSeed(d, { text: SEED, label: '自我探索A', date: '2026-09-01' });
   writeFileUnder(d, 'from-seed.md', '已有初步理解');
+  const primary = fauxModel(() => { throw new Error('interview must not use the primary model'); });
   const prompts = [];
-  const primary = fauxModel((ctx, i) => { if (i.tools.includes('send_message')) prompts.push(i.userText); return say('稍后'); });
-  const app = createApp({ config: baseConfig(d), models: { primary, reflection: primary }, adapters: [mockAdapter()] });
-  await app.start();
-  try {
-    assert.ok(await waitFor(() => readJsonl(join(d, 'state', 'proactive-log.jsonl')).some((l) => l.trigger === 'cold-start'), 5000));
-  } finally { await app.stop(); }
+  const reflection = fauxModel((ctx, i) => { prompts.push(i.userText); return say('我们从哪里开始？'); }, { id: 'reflector' });
+  const iv = createInterview({ config: baseConfig(d), models: { primary, reflection } });
+  assert.equal(await iv.open(), '我们从哪里开始？');
   assert.match(prompts[0], /导入|import/i);
+  assert.match(prompts[0], /自我探索A/);
   assert.ok(!prompts[0].includes('已有初步理解'), 'understanding content is read via tools, not preloaded');
 });
 

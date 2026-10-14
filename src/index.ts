@@ -26,6 +26,19 @@ const effectiveArgs = argIndex >= 0
   ? args.filter((_, idx) => idx !== argIndex && idx !== argIndex + 1)
   : args;
 
+// git's empty tree: diffing against it lists every file when the repo had no commit yet
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+function understandingHead(dataDir: string): string | null {
+  try {
+    return execFileSync('git', ['-C', join(dataDir, 'understanding'), 'rev-parse', '--verify', '-q', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null;
+  } catch { return null; }
+}
+function understandingDiffStat(dataDir: string, since: string | null): string {
+  try {
+    return execFileSync('git', ['-C', join(dataDir, 'understanding'), 'diff', '--stat', since || EMPTY_TREE, 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch { return ''; }
+}
+
 function loadCfg() {
   return loadConfig({ configPath: configPathFlag });
 }
@@ -137,18 +150,55 @@ async function main() {
     ensureDataDirs(cfg.dataDir);
     ensureUnderstandingRepo(cfg.dataDir);
     const text = readFileSync(filePath, 'utf8');
-    let oldHead: string | null = null;
-    try { oldHead = execFileSync('git', ['-C', join(cfg.dataDir, 'understanding'), 'rev-parse', 'HEAD']).toString().trim(); } catch {}
+    const oldHead = understandingHead(cfg.dataDir);
     const { runSeedImport } = await import('./import.js');
     const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
     const res = await runSeedImport({ config: cfg, models: { primary, reflection } }, { text, label, date });
     console.log(`imported ${res.imported}; skipped=${res.skipped}; reflection ran=${res.reflection.ran}${res.reflection.reason ? ' (' + res.reflection.reason + ')' : ''}`);
-    let stat = '';
-    try {
-      if (oldHead) stat = execFileSync('git', ['-C', join(cfg.dataDir, 'understanding'), 'diff', '--stat', oldHead, 'HEAD']).toString().trim();
-      else stat = execFileSync('git', ['-C', join(cfg.dataDir, 'understanding'), 'show', '--stat', '--format=', 'HEAD']).toString().trim();
-    } catch {}
+    const stat = understandingDiffStat(cfg.dataDir, oldHead);
     if (stat) console.log(stat);
+    process.exit(0);
+  }
+  if (cmd === 'interview') {
+    const cfg = loadCfg();
+    ensureDataDirs(cfg.dataDir);
+    ensureUnderstandingRepo(cfg.dataDir);
+    const { primary, reflection } = await makeModelsForSpecs(cfg.model, cfg.reflectionModel);
+    const oldHead = understandingHead(cfg.dataDir);
+    const { createInterview } = await import('./interview.js');
+    const iv = createInterview({ config: cfg, models: { primary, reflection } });
+    console.log(await iv.open());
+    const readline = await import('node:readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '你> ' });
+    let interrupted = false;
+    rl.on('SIGINT', () => { interrupted = true; rl.close(); });
+    rl.prompt();
+    for await (const line of rl) {
+      const trimmed = String(line).trim();
+      if (trimmed === '/exit') { rl.close(); break; }
+      if (trimmed === '') { rl.prompt(); continue; }
+      try {
+        const reply = await iv.reply(trimmed);
+        console.log(reply);
+      } catch (e: any) {
+        console.log(`⚠️ 出错了：${e?.message || e}，可以再说一次`);
+      }
+      rl.prompt();
+    }
+    if (!interrupted) {
+      console.log('整理中…');
+      try {
+        const res = await iv.close();
+        if (res.wrappedUp) {
+          const stat = understandingDiffStat(cfg.dataDir, oldHead);
+          if (stat) console.log(stat);
+        }
+      } catch (e: any) {
+        console.error(e?.message || e);
+      }
+    } else {
+      console.log('未整理；对话已保存，之后的反思会消化它');
+    }
     process.exit(0);
   }
 

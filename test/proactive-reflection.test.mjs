@@ -100,23 +100,13 @@ test('single-flight proactive wake', async () => {
   assert.ok(a.agentNote !== b.agentNote, 'second call reports it was skipped');
 });
 
-test('cold start: start() on an empty profile triggers one cold-start wake; not after conversations exist', async () => {
-  const prompts = [];
-  const { app, dataDir } = makeApp((ctx, i) => { if (isProactive(i)) prompts.push(i); return say('稍后'); });
+test('external channels never cold-start: start() on empty data sends nothing and logs no wake', async () => {
+  const { app, tg, dataDir } = makeApp(() => call('send_message', { text: '你好，想了解你' }));
   await app.start();
-  try {
-    assert.ok(await waitFor(() => log(dataDir).length > 0, 5000), 'cold-start wake happened');
-    assert.equal(log(dataDir)[0].trigger, 'cold-start');
-  } finally { await app.stop(); }
-
-  const d2 = tmpDataDir();
-  const p2 = [];
-  const b = makeApp((ctx, i) => { if (isProactive(i)) p2.push(i); return say('x'); }, { dataDir: d2 });
-  appendRaw(d2, { ts: Date.now(), channel: 'telegram', userId: ALLOWED_TG, role: 'user', text: '之前聊过' });
-  await b.app.start();
   await sleep(1500);
-  await b.app.stop();
-  assert.equal(log(d2).filter((l) => l.trigger === 'cold-start').length, 0);
+  await app.stop();
+  assert.equal(tg.sent.length, 0);
+  assert.equal(log(dataDir).length, 0);
 });
 
 test('reflection: only with new messages, uses reflection model, pages instead of dumping, advances cursor', async () => {

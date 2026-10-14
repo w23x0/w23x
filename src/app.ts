@@ -3,16 +3,18 @@ import { ensureUnderstandingRepo, listFiles } from './data/understanding.js';
 import { createEncryptedBackup } from './backup.js';
 import { allRaw, appendRaw, saveRawMedia } from './data/raw.js';
 import type { RawMessage, RawAttachment } from './data/raw.js';
-import { createAvatarAgent, runAgentTurn } from './agent/avatar.js';
+import { createAvatarAgent, runAgentTurn, buildPersonaSystemPrompt } from './agent/avatar.js';
 import { createMemoryTools } from './agent/tools.js';
 import type { ResolvedModel } from './model.js';
+import type { AppConfig } from './config.js';
 import type { ChannelAdapter, InboundMessage } from './channels/types.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { transcribe as transcribeVoice } from './transcribe.js';
 import { join } from 'node:path';
+import { trimMessages, msgContentTokens } from './agent/context.js';
 
 export interface AppDeps {
-  config: any;
+  config: AppConfig;
   models: { primary: ResolvedModel; reflection: ResolvedModel };
   adapters: ChannelAdapter[];
   now?: () => number;
@@ -21,7 +23,7 @@ export interface AppDeps {
 
 export interface ProactiveDecision {
   ts: number;
-  trigger: 'scheduled' | 'cold-start' | 'manual';
+  trigger: 'scheduled' | 'manual';
   sent: boolean;
   channel?: string;
   texts: string[];
@@ -33,7 +35,7 @@ export interface ProactiveDecision {
 export interface App {
   handleInbound(msg: InboundMessage): Promise<void>;
   runReflection(): Promise<{ ran: boolean; reason?: string }>;
-  runProactiveWake(trigger?: 'scheduled' | 'cold-start' | 'manual'): Promise<ProactiveDecision>;
+  runProactiveWake(trigger?: 'scheduled' | 'manual'): Promise<ProactiveDecision>;
   sessionMessages(): any[];
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -57,52 +59,6 @@ const ZERO_USAGE = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-
-function isCjk(ch: string): boolean {
-  const code = ch.charCodeAt(0);
-  return (code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) || (code >= 0x3040 && code <= 0x30ff) || (code >= 0xac00 && code <= 0xd7af) || (code >= 0xf900 && code <= 0xfaff);
-}
-
-function estimateTextTokens(s: string): number {
-  let cjk = 0; let other = 0;
-  for (const ch of s) { if (isCjk(ch)) cjk++; else other++; }
-  return cjk + Math.ceil(other / 4);
-}
-
-function msgContentTokens(m: any): number {
-  const c = m?.content;
-  if (typeof c === 'string') return estimateTextTokens(c);
-  if (Array.isArray(c)) {
-    return c.reduce((n: number, x: any) => {
-      if (typeof x?.text === 'string') return n + estimateTextTokens(x.text);
-      if (typeof x?.data === 'string') return n + Math.ceil(x.data.length / 4);
-      return n + 25;
-    }, 0);
-  }
-  return 0;
-}
-
-function trimMessages(messages: any[], tokenBudget: number): any[] {
-  const system = messages.filter((m) => m?.role === 'system');
-  const others = messages.filter((m) => m?.role !== 'system');
-  const blocks: any[][] = [];
-  let cur: any[] = [];
-  for (const m of others) {
-    if (m?.role === 'user' && cur.length > 0) {
-      blocks.push(cur);
-      cur = [];
-    }
-    cur.push(m);
-  }
-  if (cur.length) blocks.push(cur);
-  let total = system.reduce((n, m) => n + msgContentTokens(m), 0) +
-    others.reduce((n, m) => n + msgContentTokens(m), 0);
-  while (blocks.length > 1 && total > tokenBudget) {
-    const removed = blocks.shift()!;
-    total -= removed.reduce((n, m) => n + msgContentTokens(m), 0);
-  }
-  return [...system, ...blocks.flat()];
-}
 
 function formatTime(ts: number, channel: string): string {
   const d = new Date(ts);
@@ -174,7 +130,6 @@ export function createApp(deps: AppDeps): App {
   let started = false;
   let idleTimer: any = null;
   let proactiveTimer: any = null;
-  let coldStartTimer: any = null;
   let backupTimer: any = null;
 
   let reflectionRunning = false;
@@ -194,6 +149,15 @@ export function createApp(deps: AppDeps): App {
   }
 
   const chatAgent = createAvatarAgent(models.primary, { dataDir, mode: 'chat', transformContext: async (msgs: any[]) => trimMessages(msgs, tokenBudget) });
+  function refreshPersonaPrompt() {
+    const msgs = chatAgent.state.messages as any[];
+    const i = msgs.findIndex((m: any) => m?.role === 'system');
+    if (i >= 0) {
+      const copy = [...msgs];
+      copy[i] = { ...msgs[i], content: buildPersonaSystemPrompt(dataDir, config.personaBriefMaxChars) };
+      (chatAgent as any).state.messages = copy;
+    }
+  }
 
   // restore session
   try {
@@ -204,6 +168,7 @@ export function createApp(deps: AppDeps): App {
     for (let i = raws.length - 1; i >= 0; i--) {
       const r = raws[i];
       if (r.role === 'import') continue;
+      if (r.channel === 'cli') continue;
       let msg: any;
       if (r.role === 'user') {
         msg = { role: 'user', content: r.text, timestamp: r.ts };
@@ -299,6 +264,7 @@ export function createApp(deps: AppDeps): App {
 
         const runReadVersions = new Map<string, string>();
         chatAgent.state.tools = createMemoryTools({ dataDir, mode: 'chat', readVersions: runReadVersions });
+        refreshPersonaPrompt();
 
         const beforeMessages = [...(chatAgent.state.messages as any[])];
         let reply = '';
@@ -320,7 +286,7 @@ export function createApp(deps: AppDeps): App {
         }
         if (!failed && (lastAssistant?.stopReason === 'error' || lastAssistant?.stopReason === 'aborted' || !reply.trim())) {
           failed = true;
-          failReason = lastAssistant?.errorMessage || (reply.trim() ? 'empty reply' : 'empty reply');
+          failReason = lastAssistant?.errorMessage || 'empty reply';
         }
 
         const adapter = adapters.find((a) => a.name === msg.channel) || adapters[0];
@@ -358,15 +324,18 @@ export function createApp(deps: AppDeps): App {
         const startTs = newOnes[0]?.ts;
         const endTs = newOnes[newOnes.length - 1]?.ts;
         const imports = newOnes.filter((m) => m.role === 'import');
+        const interviews = newOnes.filter((m) => m.channel === 'cli');
         const importSummary = imports.length
           ? `Imports among them: ${imports.length} (${Array.from(new Set(imports.map((m) => `${m.source?.label || ''} ${m.source?.date || ''}`.trim()))).join('; ')})`
           : 'Imports among them: 0';
+        const interviewSummary = `Interview records (channel cli) among them: ${interviews.length}`;
         const prompt =
           `Reflection. New raw messages since last reflection: ${newOnes.length} (offset ${startOffset} to ${endOffset}).\n` +
           `Time range: ${startTs ? localTime(startTs) : ''} to ${endTs ? localTime(endTs) : ''}.\n` +
           `${importSummary}\n` +
+          `${interviewSummary}\n` +
           `Use tools (read_raw with offset/limit) to page through them; do not expect full content here. ` +
-          `Update your understanding layer if warranted; you may decide nothing is needed.\n`;
+          `Update your understanding layer if warranted; keep persona.md in sync with your understanding.\n`;
         const readVersions = new Map<string, string>();
         const reflAgent = createAvatarAgent(models.reflection, { dataDir, mode: 'reflection', readVersions });
         let failed = false;
@@ -387,7 +356,7 @@ export function createApp(deps: AppDeps): App {
       }
     },
 
-    async runProactiveWake(trigger: 'scheduled' | 'cold-start' | 'manual' = 'manual'): Promise<ProactiveDecision> {
+    async runProactiveWake(trigger: 'scheduled' | 'manual' = 'manual'): Promise<ProactiveDecision> {
       if (proactiveRunning) {
         return { ts: now(), trigger, sent: false, texts: [], agentNote: 'already running' };
       }
@@ -409,6 +378,7 @@ export function createApp(deps: AppDeps): App {
           mode: 'proactive',
           sendMessage: async (channel: string | undefined, text: string) => { await sendToContact(channel, text); },
           scheduleNextWake: schedCallback,
+          personaBriefMaxChars: config.personaBriefMaxChars,
         });
         const ch = getLastChannel();
         const channels = adapters.length ? adapters.map((a: any) => a.name).join(', ') : 'none';
@@ -416,29 +386,19 @@ export function createApp(deps: AppDeps): App {
         const pRaw = allRaw(dataDir);
         const recentProactive = pRaw.filter((m) => m.role === 'proactive').slice(-5);
         const outreachLines = recentProactive.map((pm) => {
-          const reply = pRaw.find((m) => m.role === 'user' && m.ts > pm.ts);
+          const reply = pRaw.find((m) => m.role === 'user' && m.channel !== 'cli' && m.ts > pm.ts);
           const lag = reply ? Math.round((reply.ts - pm.ts) / 60000) : null;
           const replyInfo = reply ? `用户在 ${lag} 分钟后回复` : '暂无回复';
           return `- ${localTime(pm.ts)}: ${pm.text} (${replyInfo})`;
         });
-        const uCount = pRaw.filter((m) => m.role === 'user' || m.role === 'proactive').length === 0;
-        const coldStart = trigger === 'cold-start';
-        const imports = pRaw.filter((m) => m.role === 'import');
-        const importLabels = Array.from(new Set(imports.map((m) => `${m.source?.label || ''} ${m.source?.date || ''}`.trim()))).filter(Boolean);
-        const understandingCount = (() => { try { return listFiles(dataDir).length; } catch { return 0; } })();
         const prompt = [
           `当前时间：${localTime(now())}`,
           `可用渠道：${channels}`,
           `用户最后一次来信时间：${lastContactTs ? localTime(lastContactTs) : '从未'}`,
           recentProactive.length ? `最近主动消息及后续回复：\n${outreachLines.join('\n')}` : '最近主动消息：无',
-          coldStart ? `冷启动：${uCount ? '是（尚未与用户直接对话）' : '否'}` : '',
-          coldStart ? `导入的种子对话：${imports.length ? '有（' + importLabels.join('; ') + '）' : '无'}` : '',
-          coldStart ? `理解层已有内容：${understandingCount > 0 ? understandingCount + ' 个文件' : '空'}` : '',
           '',
-          coldStart
-            ? '目标：你还几乎不认识他。主动发起一轮较完整的认识对话，以追问为主，可以分多次完成，不必一次问完。若理解层已有内容，在此基础上继续，不重复已经探索过的内容。'
-            : '目标：依据你对他的理解，特别是理解层中的不确定之处，判断现在是否值得主动找他、说什么；他冷淡或没回应时应当收敛；可以什么都不发；用 schedule_next_wake 安排下次醒来。',
-        ].filter(Boolean).join('\n');
+          '目标：以他的身份，判断此刻是否想像他那样主动找对方说点什么（陪伴，而不是为了了解他而探询；不要拿理解层里的待问问题来问）；对方冷淡或没回应时收敛；可以什么都不发；用 schedule_next_wake 安排下次醒来。',
+        ].join('\n');
         let note = '';
         try {
           note = await runAgentTurn(proactiveAgent, prompt);
@@ -506,33 +466,26 @@ export function createApp(deps: AppDeps): App {
       const delay = (nextWakeAt as number) <= now() ? 50 : Math.max(0, (nextWakeAt as number) - now());
       proactiveTimer = setTimeout(() => { app.runProactiveWake('scheduled').catch((e) => console.error('proactive timer', e)); }, delay);
 
-    if (config.backup) {
-      const envName = config.backup.passphraseEnv || 'AVATAR_BACKUP_PASSPHRASE';
+    const backup = config.backup;
+    if (backup) {
+      const envName = backup.passphraseEnv || 'AVATAR_BACKUP_PASSPHRASE';
       const passphrase = (process.env as Record<string, string | undefined>)[envName];
       if (!passphrase) {
         console.warn(`backup configured but passphrase env ${envName} is not set; backups disabled`);
       } else {
         backupTimer = setInterval(() => {
-          try { createEncryptedBackup(dataDir, config.backup.dir, passphrase); }
+          try { createEncryptedBackup(dataDir, backup.dir, passphrase); }
           catch (e) { console.error('backup timer', e); }
-        }, (config.backup.intervalHours || 24) * 3600_000);
+        }, (backup.intervalHours || 24) * 3600_000);
       }
     }
 
-      try {
-        const raws = allRaw(dataDir);
-        const hasDirect = raws.some((m) => m.role === 'user' || m.role === 'proactive');
-        if (!hasDirect) {
-          coldStartTimer = setTimeout(() => { app.runProactiveWake('cold-start').catch((e) => console.error('cold start', e)); }, 50);
-        }
-      } catch {}
     },
 
     async stop(): Promise<void> {
       started = false;
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
-      if (coldStartTimer) { clearTimeout(coldStartTimer); coldStartTimer = null; }
       if (backupTimer) { clearInterval(backupTimer); backupTimer = null; }
       for (const a of adapters) {
         try { await a.stop(); } catch {}

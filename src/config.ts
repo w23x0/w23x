@@ -26,6 +26,7 @@ export interface AppConfig {
   idleMinutes: number;
   proactiveFallbackMinutes: number;
   proactiveMinMinutes: number;
+  personaBriefMaxChars: number;
   telegramToken?: string;
   allowedTelegramUserId?: string;
   discordToken?: string;
@@ -103,6 +104,7 @@ export function loadConfig(opts?: { configPath?: string; env?: Record<string, st
     idleMinutes: fileCfg?.idleMinutes ?? 15,
     proactiveFallbackMinutes: fileCfg?.proactiveFallbackMinutes ?? 180,
     proactiveMinMinutes: fileCfg?.proactiveMinMinutes ?? 10,
+    personaBriefMaxChars: fileCfg?.personaBriefMaxChars ?? 12000,
     telegramToken: strEnv(env, 'TELEGRAM_BOT_TOKEN') ?? fileCfg?.telegramToken,
     allowedTelegramUserId: strEnv(env, 'TELEGRAM_ALLOWED_USER_ID') ?? fileCfg?.allowedTelegramUserId,
     discordToken: strEnv(env, 'DISCORD_BOT_TOKEN') ?? fileCfg?.discordToken,

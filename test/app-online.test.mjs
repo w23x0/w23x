@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { createApp } from '../dist/app.js';
+import { createInterview } from '../dist/interview.js';
 import { allRaw, appendRaw } from '../dist/data/raw.js';
 import { readFileUnder, writeFileUnder } from '../dist/data/understanding.js';
 import { tmpDataDir, fauxModel, mockAdapter, baseConfig, inbound, say, call, sleep, txt, ALLOWED_TG } from './helpers.mjs';
@@ -56,7 +57,7 @@ test('session is restored from raw after restart, including proactive messages',
 test('context stays within budget, system message kept, tool call/result pairs never split', async () => {
   const contextWindow = 3000; // tokens
   const { app, primary } = makeApp((ctx, i) => {
-    if (i.last.role === 'user' && i.userText.includes('写文件')) return call('write_understanding', { path: `n${Date.now()}.md`, content: 'x'.repeat(200) });
+    if (i.last.role === 'user' && i.userText.includes('写文件')) return call('read_raw', { from_end: true, limit: 1 });
     return say('好'.repeat(300));
   }, { modelOpts: { contextWindow } });
   for (let k = 0; k < 40; k++) await app.handleInbound(inbound((k % 3 === 0 ? '写文件 ' : '') + '内容'.repeat(400) + k));
@@ -88,60 +89,62 @@ test('model error: no empty assistant record, user gets a notice, session rolled
   assert.equal(tg.sent[1].text, '恢复了');
 });
 
-test('stale write is rejected: reflection cannot overwrite what the online turn just wrote', async () => {
+test('stale write is rejected: reflection cannot overwrite what the interview just wrote', async () => {
   const dataDir = tmpDataDir();
   let release; const gate = new Promise((r) => { release = r; });
   const results = [];
-  const online = (ctx, i) => {
-    if (i.results.length) return say('ok');
-    if (i.userText.includes('v1')) return call('write_understanding', { path: 'u.md', content: 'v1' });
-    if (i.userText.includes('clarify')) return call('read_understanding', { path: 'u.md' });
-    return say('?');
-  };
-  // online second turn: read then write v2 (needs two steps)
-  const onlineBrain = (ctx, i) => {
-    if (i.userText.includes('clarify') && i.results.length === 1) return call('write_understanding', { path: 'u.md', content: 'ONLINE-v2' });
-    return online(ctx, i);
-  };
+  const interviewer = fauxModel((ctx, i) => {
+    if (i.userText.includes('v1')) return i.results.length ? say('ok') : call('write_understanding', { path: 'u.md', content: 'v1' });
+    if (i.userText.includes('clarify')) {
+      if (i.results.length === 0) return call('read_understanding', { path: 'u.md' });
+      if (i.results.length === 1) return call('write_understanding', { path: 'u.md', content: 'INTERVIEW-v2' });
+      return say('ok');
+    }
+    return say('你好');
+  }, { id: 'interviewer' });
   const reflector = async (ctx, i) => {
     if (i.results.length === 0) return call('read_understanding', { path: 'u.md' });
     if (i.results.length === 1) { await gate; return call('write_understanding', { path: 'u.md', content: txt(i.results[0]) + '\nREFLECTION-stale' }); }
     results.push(i.results[1]);
     return say('done');
   };
-  const { app } = makeApp(onlineBrain, { dataDir, reflectionBrain: reflector });
-  await app.handleInbound(inbound('write v1'));
+  const { app, primary } = makeApp(() => say('ok'), { dataDir, reflectionBrain: reflector });
+  const iv = createInterview({ config: baseConfig(dataDir), models: { primary, reflection: interviewer } });
+  await iv.open();
+  await iv.reply('write v1');
   const refl = app.runReflection();
   await sleep(200);
-  await app.handleInbound(inbound('clarify'));
+  await iv.reply('clarify');
   release();
   await refl;
-  assert.equal(readFileUnder(dataDir, 'u.md'), 'ONLINE-v2');
+  assert.equal(readFileUnder(dataDir, 'u.md'), 'INTERVIEW-v2');
   assert.equal(results[0].isError, true, 'stale write must return an error tool result');
 });
 
 test('writing an existing file without reading it first is rejected; new files are fine', async () => {
   const dataDir = tmpDataDir();
   const seen = [];
-  const { app } = makeApp((ctx, i) => {
+  const { app } = makeApp(() => say('ok'), { dataDir, reflectionBrain: (ctx, i) => {
     if (i.results.length === 0) return call('write_understanding', { path: 'exists.md', content: 'blind' });
     if (i.results.length === 1) { seen.push(i.results[0]); return call('write_understanding', { path: 'fresh.md', content: 'new' }); }
     seen.push(i.results[1]);
     return say('ok');
-  }, { dataDir });
+  } });
   // createApp ran ensureDataDirs/ensureUnderstandingRepo; seed a file as if the user edited it
   writeFileUnder(dataDir, 'exists.md', 'user wrote this');
-  await app.handleInbound(inbound('go'));
+  appendRaw(dataDir, { ts: Date.now(), channel: 'telegram', userId: ALLOWED_TG, role: 'user', text: 'something new' });
+  await app.runReflection();
   assert.equal(seen[0].isError, true);
   assert.equal(seen[1].isError, false);
   assert.equal(readFileUnder(dataDir, 'exists.md'), 'user wrote this');
 });
 
-test('online agent has no send_message / schedule_next_wake tools', async () => {
+test('online agent reads but never writes the understanding layer, and has no send_message / schedule_next_wake', async () => {
   const { app, primary } = makeApp(() => say('ok'));
   await app.handleInbound(inbound('hi'));
   const tools = primary.calls[0].tools;
-  assert.ok(tools.includes('read_understanding') && tools.includes('write_understanding') && tools.includes('read_raw') && tools.includes('search_raw'));
+  assert.ok(tools.includes('read_understanding') && tools.includes('list_understanding') && tools.includes('read_raw') && tools.includes('search_raw'));
+  assert.ok(!tools.includes('write_understanding') && !tools.includes('delete_understanding'), `online tools: ${tools}`);
   assert.ok(!tools.includes('send_message') && !tools.includes('schedule_next_wake'));
 });
 

@@ -2,7 +2,7 @@ import { Type } from '@earendil-works/pi-ai';
 import { readFileUnder, writeFileUnder, deleteFileUnder, listFiles, contentHash, resolveUnderstandingPath } from '../data/understanding.js';
 import { existsSync } from 'node:fs';
 import { searchRaw, readRaw, allRaw } from '../data/raw.js';
-export type MemoryToolMode = 'chat' | 'reflection' | 'proactive';
+export type MemoryToolMode = 'chat' | 'proactive' | 'reflection' | 'interview';
 
 export interface MemoryToolContext {
   dataDir: string;
@@ -22,6 +22,7 @@ function errResult(text: string) {
 
 export function createMemoryTools(ctx: MemoryToolContext): any[] {
   const { dataDir, mode, readVersions } = ctx;
+  const isObserver = mode === 'reflection' || mode === 'interview';
   const tools: any[] = [
     {
       name: 'list_understanding',
@@ -53,7 +54,10 @@ export function createMemoryTools(ctx: MemoryToolContext): any[] {
         }
       },
     },
-    {
+  ];
+
+  if (isObserver) {
+    tools.push({
       name: 'write_understanding',
       label: 'Write understanding file',
       description: 'Create or overwrite a file in the understanding layer. Relative path. Auto-committed to git.',
@@ -62,7 +66,6 @@ export function createMemoryTools(ctx: MemoryToolContext): any[] {
         try {
           const path = params.path;
           const full = resolveUnderstandingPath(dataDir, path);
-          // existence check
           const exists = existsSync(full);
           if (exists) {
             const prevHash = readVersions.get(full);
@@ -78,8 +81,8 @@ export function createMemoryTools(ctx: MemoryToolContext): any[] {
           return errResult(`error: ${e?.message || e}`);
         }
       },
-    },
-    {
+    });
+    tools.push({
       name: 'delete_understanding',
       label: 'Delete understanding file',
       description: 'Delete a file from the understanding layer.',
@@ -102,60 +105,62 @@ export function createMemoryTools(ctx: MemoryToolContext): any[] {
           return errResult(`error: ${e?.message || e}`);
         }
       },
-    },
-    {
-      name: 'search_raw',
-      label: 'Search raw conversations',
-      description: 'Search the append-only raw conversation log by text/regex. Returns recent matches.',
-      parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Number()) }),
-      execute: async (_id: string, params: any) => {
-        try {
-          const hits = searchRaw(dataDir, params.query, params.limit || 40);
-          const all = allRaw(dataDir);
-          const lines = hits.map((h) => {
-            const idx = all.indexOf(h);
-            const text = `${h.text} ${h.attachments?.map((a: any) => a.transcript || '').join(' ')}`.trim();
-            let re: RegExp;
-            try { re = new RegExp(params.query, 'i'); } catch { re = new RegExp(params.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); }
-            const m = re.exec(text);
-            let snippet = text;
-            if (text.length > 400) {
-              if (m) {
-                const start = Math.max(0, m.index - 200);
-                const end = Math.min(text.length, m.index + m[0].length + 200);
-                snippet = (start > 0 ? '...' : '') + text.slice(start, end) + (end < text.length ? '...' : '');
-              } else {
-                snippet = text.slice(0, 400) + '...';
-              }
+    });
+  }
+
+  tools.push({
+    name: 'search_raw',
+    label: 'Search raw conversations',
+    description: 'Search the append-only raw conversation log by text/regex. Returns recent matches.',
+    parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Number()) }),
+    execute: async (_id: string, params: any) => {
+      try {
+        const hits = searchRaw(dataDir, params.query, params.limit || 40);
+        const all = allRaw(dataDir);
+        const lines = hits.map((h) => {
+          const idx = all.indexOf(h);
+          const text = `${h.text} ${h.attachments?.map((a: any) => a.transcript || '').join(' ')}`.trim();
+          let re: RegExp;
+          try { re = new RegExp(params.query, 'i'); } catch { re = new RegExp(params.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); }
+          const m = re.exec(text);
+          let snippet = text;
+          if (text.length > 400) {
+            if (m) {
+              const start = Math.max(0, m.index - 200);
+              const end = Math.min(text.length, m.index + m[0].length + 200);
+              snippet = (start > 0 ? '...' : '') + text.slice(start, end) + (end < text.length ? '...' : '');
+            } else {
+              snippet = text.slice(0, 400) + '...';
             }
-            const src = h.source ? ` [import: ${h.source.label}, ${h.source.date}, part ${h.source.part}/${h.source.parts}]` : '';
-            return `[offset ${idx}] [${new Date(h.ts).toISOString()}][${h.channel}][${h.role}]${src} ${snippet}`;
-          });
-          return textResult(lines.join('\n') || '(no matches)', { count: hits.length });
-        } catch (e: any) {
-          return errResult(`error: ${e?.message || e}`);
-        }
-      },
+          }
+          const src = h.source ? ` [import: ${h.source.label}, ${h.source.date}, part ${h.source.part}/${h.source.parts}]` : '';
+          return `[offset ${idx}] [${new Date(h.ts).toISOString()}][${h.channel}][${h.role}]${src} ${snippet}`;
+        });
+        return textResult(lines.join('\n') || '(no matches)', { count: hits.length });
+      } catch (e: any) {
+        return errResult(`error: ${e?.message || e}`);
+      }
     },
-    {
-      name: 'read_raw',
-      label: 'Read raw conversations',
-      description: 'Read raw conversation messages with pagination.',
-      parameters: Type.Object({ offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), from_end: Type.Optional(Type.Boolean()) }),
-      execute: async (_id: string, params: any) => {
-        try {
-          const res = readRaw(dataDir, { offset: params?.offset, limit: params?.limit, fromEnd: params?.from_end });
-          const text = res.messages.map((h) => {
-            const src = h.source ? ` [import: ${h.source.label}, ${h.source.date}, part ${h.source.part}/${h.source.parts}]` : '';
-            return `[${new Date(h.ts).toISOString()}][${h.channel}][${h.role}]${src} ${h.text}`;
-          }).join('\n');
-          return textResult(text || '(none)', { total: res.total, offset: res.offset, count: res.messages.length });
-        } catch (e: any) {
-          return errResult(`error: ${e?.message || e}`);
-        }
-      },
+  });
+
+  tools.push({
+    name: 'read_raw',
+    label: 'Read raw conversations',
+    description: 'Read raw conversation messages with pagination.',
+    parameters: Type.Object({ offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), from_end: Type.Optional(Type.Boolean()) }),
+    execute: async (_id: string, params: any) => {
+      try {
+        const res = readRaw(dataDir, { offset: params?.offset, limit: params?.limit, fromEnd: params?.from_end });
+        const text = res.messages.map((h) => {
+          const src = h.source ? ` [import: ${h.source.label}, ${h.source.date}, part ${h.source.part}/${h.source.parts}]` : '';
+          return `[${new Date(h.ts).toISOString()}][${h.channel}][${h.role}]${src} ${h.text}`;
+        }).join('\n');
+        return textResult(text || '(none)', { total: res.total, offset: res.offset, count: res.messages.length });
+      } catch (e: any) {
+        return errResult(`error: ${e?.message || e}`);
+      }
     },
-  ];
+  });
 
   if (mode === 'proactive') {
     tools.push({
